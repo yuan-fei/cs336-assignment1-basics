@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from heapq import merge
 import os
 from collections.abc import Iterable
+import time
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
+import re
+import regex
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
@@ -589,4 +593,138 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    vocabulary_mapping:dict[int, bytes]=dict()
+    token_bytes_to_id:dict[bytes, int]={}
+    merges:list[tuple[bytes, bytes]]=[]
+    
+    def pre_tokenize(data: str, special_tokens: list[str]) -> dict[tuple[int,...], int]:
+        PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+        SEP = '|'.join([re.escape(token) for token in special_tokens])
+        pre_tokens = [filtered for separated in re.split(SEP, data) for filtered in regex.findall(PAT, separated, flags=regex.UNICODE)]
+        pre_token_ids_to_freq: dict[tuple[int,...], int] = dict()
+        for pre_token in pre_tokens:
+            pre_token_byte_seq = tuple(token_bytes_to_id[bytes([b])] for b in pre_token.encode("utf-8"))
+            if pre_token_byte_seq not in pre_token_ids_to_freq:
+                pre_token_ids_to_freq[pre_token_byte_seq] = 0
+            pre_token_ids_to_freq[pre_token_byte_seq] += 1
+        return pre_token_ids_to_freq
+
+
+    def add_token_bytes(token_byte: bytes):
+        if token_byte not in token_bytes_to_id:
+            token_bytes_to_id[token_byte] = len(vocabulary_mapping)
+            vocabulary_mapping[len(vocabulary_mapping)] = token_byte
+        return token_bytes_to_id[token_byte]
+    
+    def merge_tokens_id_pair(token_id_pair: tuple[int, int]):
+        merges.append((vocabulary_mapping[token_id_pair[0]], vocabulary_mapping[token_id_pair[1]]))
+        merge_bytes = bytes(vocabulary_mapping[token_id_pair[0]] + vocabulary_mapping[token_id_pair[1]])
+        return add_token_bytes(merge_bytes)
+        
+
+
+    def count_bpe_pairs_freq(tokenized_data: list[int]) -> dict[tuple[int, int], int]:
+        bpe_pair_freqs: dict[tuple[int, int], int] = dict()
+        for i in range(len(tokenized_data) - 1):
+            token1_id = tokenized_data[i]
+            token2_id = tokenized_data[i + 1]
+            pair = (token1_id, token2_id)
+            if pair not in bpe_pair_freqs:
+                bpe_pair_freqs[pair] = 0
+            bpe_pair_freqs[pair] += 1
+        return bpe_pair_freqs
+    
+    def count_bpe_pairs_freq_for_pretokens(pre_tokens_ids_to_freq: dict[tuple[int,...], int]) -> dict[tuple[int, int], int]:
+        bpe_pair_freqs: dict[tuple[int, int], int] = dict()
+        for pre_tokens_ids, freq in pre_tokens_ids_to_freq.items():
+            for pair, count in count_bpe_pairs_freq(pre_tokens_ids).items():
+                if pair not in bpe_pair_freqs:
+                    bpe_pair_freqs[pair] = 0
+                bpe_pair_freqs[pair] += count * freq
+        return bpe_pair_freqs
+
+    def get_most_frequent_pair_by_token_id(pair_freqs: dict[tuple[int, int], int]) -> tuple[int, int]:
+        # return the pair with the highest frequency, break ties by perfering lexicographical greater order
+        return max(pair_freqs.items(), key=lambda item: (item[1], (vocabulary_mapping[item[0][0]], vocabulary_mapping[item[0][1]])))[0]
+    
+    def merge(tokenized_data: list[int], pair_to_merge: tuple[int, int], new_token_id: int) -> tuple[list[int], list[tuple[int,int]], list[tuple[int,int]], int]:
+        new_tokenized_data: list[int] = []
+        new_bpe_pairs: list[tuple[int,int]] = []
+        old_bpe_pairs: list[tuple[int,int]] = []
+        new_token_cnt = 0
+        i = 0
+        while i < len(tokenized_data):
+            if i < len(tokenized_data) - 1 and (tokenized_data[i], tokenized_data[i + 1]) == pair_to_merge:
+                # Track old pairs that will be removed
+                if len(new_tokenized_data) > 0:
+                    old_bpe_pairs.append((new_tokenized_data[-1], tokenized_data[i]))
+                if i + 2 < len(tokenized_data):
+                    old_bpe_pairs.append((tokenized_data[i + 1], tokenized_data[i + 2]))
+                
+                # Add merged token
+                new_tokenized_data.append(new_token_id)
+                new_token_cnt += 1
+                i += 2
+                
+                # Track new pairs that will be added
+                if len(new_tokenized_data) > 1:
+                    new_bpe_pairs.append((new_tokenized_data[-2], new_token_id))
+                if i < len(tokenized_data):
+                    new_bpe_pairs.append((new_token_id, tokenized_data[i]))
+            else:
+                new_tokenized_data.append(tokenized_data[i])
+                i += 1
+        return new_tokenized_data, new_bpe_pairs, old_bpe_pairs, new_token_cnt
+
+    def merge_for_pretokens(pre_tokens_ids_to_freq: dict[tuple[int,...], int], bpe_pair_freqs: dict[tuple[int, int], int], token_id_pair_to_be_replaced: tuple[int, int], merged_token_id: int) -> None:
+        for pre_tokens_ids, pre_tokens_freq in list(pre_tokens_ids_to_freq.items()):
+            new_pre_token_ids, new_bpe_pairs, old_bpe_pairs, new_token_cnt = merge(list(pre_tokens_ids), token_id_pair_to_be_replaced, merged_token_id)
+            pre_tokens_ids_to_freq[tuple(new_pre_token_ids)] = pre_tokens_freq
+            if pre_tokens_ids != tuple(new_pre_token_ids):
+                del pre_tokens_ids_to_freq[pre_tokens_ids]
+
+            # Add new pairs
+            for new_bpe_pair in new_bpe_pairs:
+                if new_bpe_pair not in bpe_pair_freqs:
+                    bpe_pair_freqs[new_bpe_pair] = 0
+                bpe_pair_freqs[new_bpe_pair] += pre_tokens_freq
+            
+            # Remove old pairs
+            for old_bpe_pair in old_bpe_pairs:
+                bpe_pair_freqs[old_bpe_pair] -= pre_tokens_freq
+                
+            # Remove the merged pair
+            bpe_pair_freqs[token_id_pair_to_be_replaced] -= new_token_cnt * pre_tokens_freq
+
+    tokenized_data: list[int] = []
+    # read bytes from input_path
+    with open(input_path, "rb") as f:
+        data = f.read()
+
+    # add special tokens to vocab
+    for token in special_tokens:
+        add_token_bytes(token.encode("utf-8"))
+
+    # add 256 bytes values to vocab
+    for byte_value in range(256):
+        add_token_bytes(bytes([byte_value]))
+        
+    # add each byte as a token
+    for token_byte in data:
+        add_token_bytes(bytes([token_byte]))
+        tokenized_data.append(token_bytes_to_id[bytes([token_byte])])
+
+    pre_tokens_ids_to_freq = pre_tokenize(data.decode("utf-8", errors="ignore"), special_tokens)
+    bpe_pair_freqs: dict[tuple[int, int], int] = count_bpe_pairs_freq_for_pretokens(pre_tokens_ids_to_freq)
+    while len(vocabulary_mapping) < vocab_size:
+        most_frequent_pair_by_token_id: tuple[int, int] = get_most_frequent_pair_by_token_id(bpe_pair_freqs)
+        # print("most frequent pair:", vocabulary_mapping[most_frequent_pair_by_token_id[0]], vocabulary_mapping[most_frequent_pair_by_token_id[1]], "with frequency:", bpe_pair_freqs[most_frequent_pair_by_token_id])
+        # print(len(merges)," - Merging pair:", vocabulary_mapping[most_frequent_pair_by_token_id[0]], vocabulary_mapping[most_frequent_pair_by_token_id[1]], "with frequency:", bpe_pair_freqs[most_frequent_pair_by_token_id])
+        merged_token_id = merge_tokens_id_pair(most_frequent_pair_by_token_id)
+        merge_for_pretokens(pre_tokens_ids_to_freq, bpe_pair_freqs, most_frequent_pair_by_token_id, merged_token_id)
+    
+    return vocabulary_mapping, merges
+
+
+
+
