@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from heapq import merge
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 import time
 from typing import IO, Any, BinaryIO
 
@@ -12,7 +12,7 @@ import regex
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
-
+from collections import Counter
 
 def run_linear(
     d_in: int,
@@ -563,7 +563,72 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    class BPETokenizer:
+        def __init__(
+            self,
+            vocab: dict[int, bytes],
+            merges: list[tuple[bytes, bytes]],
+            special_tokens: list[str] | None = None,
+        ):
+            self.vocab = vocab
+            self.bytes_to_id = {v: k for k, v in vocab.items()}
+            self.merge_rank = {pair: i for i, pair in enumerate(merges)}
+            self.special_tokens_sorted = sorted(special_tokens or [], key=len, reverse=True)
+
+        def encode(self, text: str) -> list[int]:
+            result: list[int] = []
+            for item in self._split_by_special_tokens(text):
+                if isinstance(item, int):
+                    result.append(item)
+                else:
+                    for pretoken in pre_tokenize_chunking(item.decode("utf-8"), []):
+                        result.extend(self._encode_pretoken(pretoken.encode("utf-8")))
+            return result
+
+        def _split_by_special_tokens(self, text: str) -> list[bytes | int]:
+            result: list[bytes | int] = [text.encode('utf-8')]
+            for token in self.special_tokens_sorted:
+                token_bytes, token_id = token.encode('utf-8'), self.bytes_to_id.get(token.encode('utf-8'))
+                if token_id is None:
+                    continue
+                new_result: list[bytes | int] = []
+                for item in result:
+                    if isinstance(item, int):
+                        new_result.append(item)
+                    else:
+                        parts = item.split(token_bytes)
+                        for i, part in enumerate(parts):
+                            if part:
+                                new_result.append(part)
+                            if i < len(parts) - 1:
+                                new_result.append(token_id)
+                result = new_result
+            return result
+
+        def _encode_pretoken(self, text_bytes: bytes) -> list[int]:
+            tokens = [bytes([b]) for b in text_bytes]
+            while len(tokens) > 1:
+                best_idx, best_rank = None, float('inf')
+                for i in range(len(tokens) - 1):
+                    pair = (tokens[i], tokens[i + 1])
+                    rank = self.merge_rank.get(pair, float('inf'))
+                    if rank < best_rank:
+                        best_rank, best_idx = rank, i
+                if best_idx is None:
+                    break
+                tokens = tokens[:best_idx] + [tokens[best_idx] + tokens[best_idx + 1]] + tokens[best_idx + 2:]
+            return [self.bytes_to_id[t] for t in tokens]
+
+        def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+            # Given an iterable of strings (e.g., a Python file handle), return a generator that lazily yields token IDs.
+            # This is required for memory-efficient tokenization of large files that we cannot directly load into memory.
+            for line in iterable:
+                yield from self.encode(line)
+
+        def decode(self, token_ids: list[int]) -> str:
+            return b"".join(self.vocab[tid] for tid in token_ids).decode("utf-8", errors="ignore")
+
+    return BPETokenizer(vocab, merges, special_tokens)
 
 
 def run_train_bpe(
@@ -593,7 +658,6 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    from collections import Counter
 
     vocab: dict[int, bytes] = {}
     token_to_id: dict[bytes, int] = {}
@@ -604,12 +668,9 @@ def run_train_bpe(
             token_to_id[token] = len(vocab)
             vocab[len(vocab)] = token
         return token_to_id[token]
-
+    
     def pre_tokenize(text: str) -> Counter[tuple[int, ...]]:
-        PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-        sep_pattern = '|'.join(re.escape(t) for t in special_tokens) if special_tokens else None
-        chunks = re.split(sep_pattern, text) if sep_pattern else [text]
-        pre_tokens = [m for chunk in chunks for m in regex.findall(PAT, chunk, flags=regex.UNICODE)]
+        pre_tokens = pre_tokenize_chunking(text, special_tokens)
         return Counter(
             tuple(token_to_id[bytes([b])] for b in pt.encode("utf-8")) for pt in pre_tokens
         )
@@ -697,5 +758,10 @@ def run_train_bpe(
     return vocab, merges
 
 
-
+def pre_tokenize_chunking(text: str, special_tokens: list[str]) -> list[str]:
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    sep_pattern = '|'.join(re.escape(t) for t in special_tokens) if special_tokens else None
+    chunks = re.split(sep_pattern, text) if sep_pattern else [text]
+    return [m for chunk in chunks for m in regex.findall(PAT, chunk, flags=regex.UNICODE)]
+    
 
