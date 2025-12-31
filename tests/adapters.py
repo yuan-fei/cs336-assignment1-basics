@@ -605,24 +605,23 @@ def run_train_bpe(
             vocab[len(vocab)] = token
         return token_to_id[token]
 
-    def pre_tokenize(text: str) -> dict[tuple[int, ...], int]:
+    def pre_tokenize(text: str) -> Counter[tuple[int, ...]]:
         PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
         sep_pattern = '|'.join(re.escape(t) for t in special_tokens) if special_tokens else None
         chunks = re.split(sep_pattern, text) if sep_pattern else [text]
         pre_tokens = [m for chunk in chunks for m in regex.findall(PAT, chunk, flags=regex.UNICODE)]
-        freq: dict[tuple[int, ...], int] = Counter(
+        return Counter(
             tuple(token_to_id[bytes([b])] for b in pt.encode("utf-8")) for pt in pre_tokens
         )
-        return freq
 
-    def count_pair_freqs(pretoken_freqs: dict[tuple[int, ...], int]) -> dict[tuple[int, int], int]:
-        pair_freqs: dict[tuple[int, int], int] = Counter()
+    def count_pair_freqs(pretoken_freqs: Counter[tuple[int, ...]]) -> Counter[tuple[int, int]]:
+        pair_freqs: Counter[tuple[int, int]] = Counter()
         for token_ids, freq in pretoken_freqs.items():
             for i in range(len(token_ids) - 1):
                 pair_freqs[(token_ids[i], token_ids[i + 1])] += freq
         return pair_freqs
 
-    def get_best_pair(pair_freqs: dict[tuple[int, int], int]) -> tuple[int, int]:
+    def get_best_pair(pair_freqs: Counter[tuple[int, int]]) -> tuple[int, int]:
         # return the pair with the highest frequency, break ties by perfering lexicographical greater order
         return max(pair_freqs, key=lambda p: (pair_freqs[p], vocab[p[0]], vocab[p[1]]))
 
@@ -653,8 +652,8 @@ def run_train_bpe(
         return result, new_pairs, old_pairs, merge_count
 
     def apply_merge(
-        pretoken_freqs: dict[tuple[int, ...], int],
-        pair_freqs: dict[tuple[int, int], int],
+        pretoken_freqs: Counter[tuple[int, ...]],
+        pair_freqs: Counter[tuple[int, int]],
         pair: tuple[int, int],
         new_id: int,
     ) -> None:
